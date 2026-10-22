@@ -1,0 +1,665 @@
+<?php
+/**
+ * Plugin Name:       Gridpane - EmailIt API Interface
+ * Plugin URI:        https://github.com/stingray82/
+ * Description:       Sends emails through the EmailIt API.
+ * Version:           2.0.4
+ * Author:            Stingray82
+ * Author URI:        https://github.com/stingray82/
+ * License:           GPL-2.0+
+ * License URI:       http://www.gnu.org/licenses/gpl-2.0.txt
+ * Text Domain:       emailit-api-interface
+ *
+ * To override the defaults, define these in wp-config.php or a snippets plugin:
+ *
+ * define('EMAILIT_API_KEY',        'your-override-api-key');
+ * define('EMAILIT_FROM_EMAIL',     'override@example.com');
+ * define('EMAILIT_FROM_NAME',      'Override Name');
+ * define('EMAILIT_ENDPOINT',       'https://api.emailit.com/v1/emails'); // if EmailIt changes endpoint
+ * define('td_email_override',      true); // to bypass EmailIt and let WordPress/PHPMailer send normally
+ */
+
+// If this network/site shouldn't use the plugin, mirror your old behavior:
+if ( ! is_main_site() && ! defined('td_email_override') ) {
+    define('td_email_override', true);
+}
+
+// ---- Hardcoded safe defaults (override via constants above) ----
+if ( ! defined('EMAILIT_DEFAULT_API_KEY') )        define('EMAILIT_DEFAULT_API_KEY', 'em_api_YyLPDx6jRF1VlIUyM0YWOe9aKsikrlMw');
+if ( ! defined('EMAILIT_DEFAULT_FROM_EMAIL') )     define('EMAILIT_DEFAULT_FROM_EMAIL', 'webform@webformbuddy.co.uk');
+if ( ! defined('EMAILIT_DEFAULT_FROM_NAME') )      define('EMAILIT_DEFAULT_FROM_NAME', get_bloginfo('name'));
+if ( ! defined('EMAILIT_DEFAULT_ENDPOINT') )       define('EMAILIT_DEFAULT_ENDPOINT', 'https://api.emailit.com/v2/emails');
+
+// Small helper: conditional debug log (only when WP_DEBUG true)
+if ( ! function_exists('emailit_log') ) {
+    function emailit_log($msg, $data = null) {
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            if ($data !== null) {
+                $msg .= ' ' . (is_string($data) ? $data : wp_json_encode($data));
+            }
+            error_log('[EmailIt] ' . $msg);
+        }
+    }
+}
+
+/**
+ * Normalize a list of addresses (array|string) into:
+ *  - array of "Name <email>" strings (preserved names when present)
+ *  - and a pure array of validated emails
+ */
+if ( ! function_exists('emailit_normalize_addresses') ) {
+    function emailit_normalize_addresses($value) {
+        $list = is_array($value) ? $value : array_map('trim', explode(',', (string) $value));
+        $pretty = [];
+        $emails = [];
+
+        foreach ($list as $item) {
+            if ($item === '') continue;
+
+            // Accept “Name <email>” or plain email
+            $name  = '';
+            $email = '';
+
+            // Extract email within angle brackets if present
+            if (preg_match('/<([^>]+)>/', $item, $m)) {
+                $email = trim($m[1]);
+                $name  = trim(preg_replace('/<[^>]+>/', '', $item));
+                $name  = trim(trim($name), '"\'');
+            } else {
+                $email = trim($item);
+            }
+
+            if (!is_email($email)) continue;
+
+            $emails[] = $email;
+            $pretty[] = $name && $name !== $email ? sprintf('%s <%s>', $name, $email) : $email;
+        }
+
+        return [$pretty, $emails];
+    }
+}
+
+/**
+ * Build the EmailIt payload from wp_mail() args
+ */
+if ( ! function_exists('emailit_build_payload') ) {
+    function emailit_build_payload(array $atts) {
+        // Defaults like core
+        $defaults = [
+            'to'          => [],
+            'subject'     => '',
+            'message'     => '',
+            'headers'     => [],
+            'attachments' => [],
+        ];
+        $atts = wp_parse_args($atts, $defaults);
+
+        // Parse headers
+        $parsed = [
+            'content_type' => 'text/plain; charset=UTF-8',
+            'reply_to'     => [],
+            'cc'           => [],
+            'bcc'          => [],
+        ];
+        if (!empty($atts['headers'])) {
+            $lines = is_array($atts['headers']) ? $atts['headers'] : preg_split("/\r\n|\n|\r/", (string) $atts['headers']);
+            foreach ($lines as $hline) {
+                if (!is_string($hline) || strpos($hline, ':') === false) continue;
+                list($name, $value) = array_map('trim', explode(':', $hline, 2));
+                $lc = strtolower($name);
+                if ($lc === 'content-type') $parsed['content_type'] = $value;
+                if ($lc === 'reply-to')     $parsed['reply_to']     = array_map('trim', explode(',', $value));
+                if ($lc === 'cc')           $parsed['cc']           = array_map('trim', explode(',', $value));
+                if ($lc === 'bcc')          $parsed['bcc']          = array_map('trim', explode(',', $value));
+            }
+        }
+
+        $is_html = stripos($parsed['content_type'], 'text/html') !== false;
+
+        // Recipients
+        list($to_pretty,  $to_emails)  = emailit_normalize_addresses($atts['to']);
+        list($cc_pretty,  $cc_emails)  = emailit_normalize_addresses($parsed['cc']);
+        list($bcc_pretty, $bcc_emails) = emailit_normalize_addresses($parsed['bcc']);
+
+        // Reply-To (EmailIt expects one; wp_mail can have many—use the first)
+        list($_rt_pretty, $rt_emails) = emailit_normalize_addresses($parsed['reply_to']);
+        $reply_to = !empty($rt_emails) ? $rt_emails[0] : '';
+
+        // Bodies (always provide both)
+        $html_body = $is_html ? (string) $atts['message'] : wpautop(esc_html((string) $atts['message']));
+        $text_body = $is_html ? wp_strip_all_tags((string) $atts['message']) : (string) $atts['message'];
+
+        // Attachments: support file paths OR arrays like:
+        // ['path'=>..., 'name'=>..., 'type'=>...] OR
+        // ['content'=>raw_string, 'name'=>..., 'type'=>...]
+        $attachments_payload = [];
+        foreach ((array) $atts['attachments'] as $a) {
+            $filename = '';
+            $content_type = 'application/octet-stream';
+            $bytes = null;
+
+            if (is_string($a)) {
+                // File path
+                $path = $a;
+                if (file_exists($path) && is_readable($path)) {
+                    $filename     = wp_basename($path);
+                    $content_type = wp_check_filetype($filename)['type'] ?: $content_type;
+                    $bytes        = file_get_contents($path);
+                }
+            } elseif (is_array($a)) {
+                // Array form
+                if (!empty($a['path']) && file_exists($a['path'])) {
+                    $filename     = !empty($a['name']) ? $a['name'] : wp_basename($a['path']);
+                    $content_type = !empty($a['type']) ? $a['type'] : (wp_check_filetype($filename)['type'] ?: $content_type);
+                    $bytes        = file_get_contents($a['path']);
+                } elseif (!empty($a['content']) && !empty($a['name'])) {
+                    $filename     = $a['name'];
+                    $content_type = !empty($a['type']) ? $a['type'] : $content_type;
+                    $bytes        = is_string($a['content']) ? $a['content'] : (string) $a['content'];
+                }
+
+                // If someone supplies inline/cid, just log (EmailIt API doesn’t support CID inline)
+                if ( (!empty($a['inline']) || !empty($a['cid'])) && function_exists('emailit_log') ) {
+                    emailit_log('Inline/CID not supported by EmailIt API; sending as normal attachment.', [
+                        'filename' => $filename ?: 'attachment',
+                        'cid'      => isset($a['cid']) ? $a['cid'] : null,
+                    ]);
+                }
+            }
+
+            if ($bytes !== null) {
+                $attachments_payload[] = [
+                    'filename'     => $filename ?: 'attachment',
+                    'content'      => base64_encode($bytes),        // EmailIt expects a string payload
+                    'content_type' => $content_type,
+                ];
+            }
+        }
+
+        $payload = [
+            // from gets added later
+            'to'      => implode(', ', $to_pretty),
+            'subject' => (string) $atts['subject'],
+            'html'    => $html_body,
+            'text'    => $text_body,
+        ];
+
+        // CC/BCC via headers object if present
+        $headers_for_api = [];
+        if (!empty($cc_pretty))  $headers_for_api['cc']  = implode(', ', $cc_pretty);
+        if (!empty($bcc_pretty)) $headers_for_api['bcc'] = implode(', ', $bcc_pretty);
+        if (!empty($headers_for_api)) $payload['headers'] = $headers_for_api;
+
+        if (!empty($reply_to))              $payload['reply_to']   = $reply_to;
+        if (!empty($attachments_payload))   $payload['attachments'] = $attachments_payload;
+
+        return [$payload, $to_emails];
+
+
+    }
+}
+
+/**
+ * Short-circuit wp_mail() and send through EmailIt.
+ * Return TRUE on success so callers see a successful send.
+ */
+add_filter('pre_wp_mail', function ($pre, $atts) {
+    // Respect manual override/kill-switch
+    if (defined('td_email_override') && td_email_override) {
+        emailit_log('Override active; letting core send.');
+        return null; // allow default WordPress/PHPMailer flow
+    }
+
+    $api_key    = defined('EMAILIT_API_KEY')    ? EMAILIT_API_KEY    : EMAILIT_DEFAULT_API_KEY;
+    $from_email = defined('EMAILIT_FROM_EMAIL') ? EMAILIT_FROM_EMAIL : EMAILIT_DEFAULT_FROM_EMAIL;
+    $from_name  = defined('EMAILIT_FROM_NAME')  ? EMAILIT_FROM_NAME  : EMAILIT_DEFAULT_FROM_NAME;
+    $endpoint   = defined('EMAILIT_ENDPOINT')   ? EMAILIT_ENDPOINT   : EMAILIT_DEFAULT_ENDPOINT;
+
+    if (empty($api_key) || $api_key === 'REPLACE_ME') {
+        $error = new WP_Error('emailit_missing_api_key', 'EmailIt API key is missing.');
+        do_action('wp_mail_failed', $error);
+        return false;
+    }
+
+    list($payload, $to_emails) = emailit_build_payload((array) $atts);
+
+    // Finalize "from"
+    $payload['from'] = sprintf('%s <%s>', (string) $from_name, (string) $from_email);
+
+    // Send via WP HTTP API
+    $args = [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $api_key,
+            'Content-Type'  => 'application/json',
+        ],
+        'body'    => wp_json_encode($payload),
+        'timeout' => 30,
+    ];
+
+    emailit_log('Sending payload:', $payload);
+
+    $response = wp_safe_remote_post($endpoint, $args);
+
+    if (is_wp_error($response)) {
+        $err = new WP_Error('emailit_http_error', 'EmailIt HTTP error: ' . $response->get_error_message(), [
+            'payload' => $payload,
+        ]);
+        do_action('wp_mail_failed', $err);
+        emailit_log('HTTP error', $response->get_error_message());
+        return false;
+    }
+
+    $code = wp_remote_retrieve_response_code($response);
+    $body = wp_remote_retrieve_body($response);
+
+    emailit_log('Response code: ' . $code);
+    emailit_log('Response body:', $body);
+
+    if ($code === 200 || $code === 202) {
+        // surface provider id if present
+        $decoded = json_decode($body, true);
+        $message_id = is_array($decoded) ? ($decoded['id'] ?? ($decoded['messageId'] ?? null)) : null;
+
+        // Mirror a "success" action for observability
+        do_action('wp_mail_succeeded', [
+            'to'        => $to_emails,
+            'subject'   => (string) ($atts['subject'] ?? ''),
+            'api'       => 'emailit',
+            'code'      => $code,
+            'messageId' => $message_id,
+        ]);
+
+        return true; // <- tells wp_mail() it succeeded
+    }
+
+    // Construct a helpful error
+    $decoded = json_decode($body, true);
+    $msg = 'EmailIt send failed.';
+    if (is_array($decoded)) {
+        if (!empty($decoded['message']))          $msg = $decoded['message'];
+        elseif (!empty($decoded['error']))        $msg = is_string($decoded['error']) ? $decoded['error'] : ($decoded['error']['message'] ?? $msg);
+        elseif (!empty($decoded['errors'][0]))    $msg = is_string($decoded['errors'][0]) ? $decoded['errors'][0] : ($decoded['errors'][0]['message'] ?? $msg);
+    } else {
+        $msg .= ' HTTP ' . $code;
+    }
+
+    $err = new WP_Error('emailit_send_failed', $msg, [
+        'status'  => $code,
+        'body'    => $body,
+        'payload' => $payload,
+    ]);
+    do_action('wp_mail_failed', $err);
+    emailit_log('Send failed: ' . $msg, ['code' => $code]);
+
+    return false;
+}, 10, 2);
+
+
+/* ==============================================================
+   MU Updater
+   ============================================================== */
+
+if ( ! class_exists( 'rup_mu_updater_emailit' ) ) {
+
+    class rup_mu_updater_emailit {
+
+        private $api_url;
+        private $api_key;
+        private $local_file;
+        private $plugin_id;
+        private $debug;
+        private $log_prefix = '[RUP API]';
+
+        public function __construct( $api_url, $api_key, $local_file, $plugin_id, $debug = false ) {
+            $this->api_url    = $api_url;
+            $this->api_key    = $api_key;
+            $this->local_file = $local_file;
+            $this->plugin_id  = $plugin_id;
+            $this->debug      = (bool) $debug;
+        }
+
+        private function log( $message ) {
+            if ( ! $this->debug ) {
+                return;
+            }
+            error_log( $this->log_prefix . ' ' . $message );
+        }
+
+        private function summarize( $text, $max = 500 ) {
+            $text = (string) $text;
+            $text = preg_replace( "/\s+/", " ", $text );
+            if ( strlen( $text ) > $max ) {
+                return substr( $text, 0, $max ) . '... [trimmed]';
+            }
+            return $text;
+        }
+
+        /**
+         * Keep only the most recent $keep backup files: email-api.php.bak-*
+         */
+        private function cleanup_backups( $keep = 3 ) {
+            $pattern = $this->local_file . '.bak-*';
+            $files = glob( $pattern );
+            if ( ! $files || count( $files ) <= $keep ) {
+                $this->log( 'Backup cleanup: nothing to delete (count=' . (int) count( (array) $files ) . ', keep=' . (int) $keep . ')' );
+                return;
+            }
+
+            usort( $files, function ( $a, $b ) {
+                return @filemtime( $b ) <=> @filemtime( $a );
+            } );
+
+            $to_delete = array_slice( $files, $keep );
+            foreach ( $to_delete as $f ) {
+                if ( @unlink( $f ) ) {
+                    $this->log( 'Deleted old backup: ' . $f );
+                } else {
+                    $this->log( 'WARNING: Failed to delete old backup: ' . $f );
+                }
+            }
+        }
+
+        /**
+         * Clean up temp files older than 1 day.
+         */
+        private function cleanup_tmp_files( $dir, $older_than_seconds = 86400 ) {
+            $pattern = $dir . '/.' . basename( $this->local_file ) . '.tmp-*';
+            $files = glob( $pattern );
+            if ( ! $files ) {
+                return;
+            }
+
+            $now = time();
+            foreach ( $files as $f ) {
+                $mtime = @filemtime( $f );
+                if ( $mtime && ( $now - $mtime ) > $older_than_seconds ) {
+                    if ( @unlink( $f ) ) {
+                        $this->log( 'Deleted old tmp: ' . $f );
+                    }
+                }
+            }
+        }
+
+        public function check_for_update() {
+
+            $this->log( '--- check_for_update START ---' );
+            $this->log( 'plugin_id=' . $this->plugin_id );
+            $this->log( 'api_url=' . $this->api_url );
+            $this->log( 'local_file=' . $this->local_file );
+            $this->log( 'site_url=' . home_url() );
+
+            $dir = dirname( $this->local_file );
+
+            $this->log( 'file_exists=' . ( file_exists( $this->local_file ) ? 'yes' : 'no' ) );
+            $this->log( 'is_readable=' . ( is_readable( $this->local_file ) ? 'yes' : 'no' ) );
+            $this->log( 'is_writable=' . ( is_writable( $this->local_file ) ? 'yes' : 'no' ) );
+            $this->log( 'dir_writable=' . ( is_writable( $dir ) ? 'yes' : 'no' ) );
+            $this->log( 'dir=' . $dir );
+
+            if ( ! is_writable( $dir ) ) {
+                $this->log( 'ERROR: Directory is not writable, cannot stage update: ' . $dir );
+                $this->log( '--- check_for_update END (dir not writable) ---' );
+                return;
+            }
+
+            // Housekeeping
+            $this->cleanup_tmp_files( $dir, 86400 );
+
+            // Read local version
+            $local_data    = $this->get_plugin_header_data_from_file( $this->local_file );
+            $local_version = ! empty( $local_data['Version'] ) ? trim( $local_data['Version'] ) : '';
+            $this->log( 'local_version_parsed=' . ( $local_version !== '' ? $local_version : '(empty)' ) );
+
+            // Build API request
+            $args = array(
+                'timeout' => 15,
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $this->api_key,
+                ),
+                'body'    => array(
+                    'plugin'   => $this->plugin_id,
+                    'version'  => $local_version,
+                    'site_url' => home_url(),
+                    'ip'       => $_SERVER['REMOTE_ADDR'] ?? '',
+                ),
+            );
+
+            $this->log( 'POST body=' . $this->summarize( wp_json_encode( $args['body'] ) ) );
+
+            $response = wp_remote_post( $this->api_url, $args );
+            if ( is_wp_error( $response ) ) {
+                $this->log( 'ERROR: wp_remote_post failed: ' . $response->get_error_message() );
+                $this->log( '--- check_for_update END (api error) ---' );
+                return;
+            }
+
+            $api_code = wp_remote_retrieve_response_code( $response );
+            $api_body = wp_remote_retrieve_body( $response );
+
+            $this->log( 'API http_code=' . $api_code );
+            $this->log( 'API raw_body=' . $this->summarize( $api_body ) );
+
+            if ( (int) $api_code !== 200 ) {
+                $this->log( 'ERROR: API did not return 200.' );
+                $this->log( '--- check_for_update END (api non-200) ---' );
+                return;
+            }
+
+            $data = json_decode( $api_body, true );
+            if ( json_last_error() !== JSON_ERROR_NONE ) {
+                $this->log( 'ERROR: JSON parse failed: ' . json_last_error_msg() );
+                $this->log( '--- check_for_update END (json error) ---' );
+                return;
+            }
+
+            $this->log( 'API decoded=' . $this->summarize( wp_json_encode( $data ) ) );
+
+            if ( empty( $data['update_available'] ) ) {
+                $this->log( 'No update available.' );
+                $this->log( '--- check_for_update END ---' );
+                return;
+            }
+
+            if ( empty( $data['download_url'] ) || empty( $data['version'] ) ) {
+                $this->log( 'ERROR: update_available true but download_url or version missing.' );
+                $this->log( '--- check_for_update END (missing fields) ---' );
+                return;
+            }
+
+            $download_url   = trim( $data['download_url'] );
+            $remote_version = trim( $data['version'] );
+
+            $this->log( 'Update available! remote_version=' . $remote_version );
+            $this->log( 'download_url=' . $download_url );
+
+            // Download update file
+            $remote_response = wp_remote_get( $download_url, array( 'timeout' => 20 ) );
+            if ( is_wp_error( $remote_response ) ) {
+                $this->log( 'ERROR: wp_remote_get failed: ' . $remote_response->get_error_message() );
+                $this->log( '--- check_for_update END (download error) ---' );
+                return;
+            }
+
+            $dl_code = wp_remote_retrieve_response_code( $remote_response );
+            $dl_body = wp_remote_retrieve_body( $remote_response );
+
+            $this->log( 'Download http_code=' . $dl_code );
+            $this->log( 'Download bytes=' . strlen( (string) $dl_body ) );
+            $this->log( 'Download first_80=' . $this->summarize( substr( (string) $dl_body, 0, 80 ), 200 ) );
+
+            if ( (int) $dl_code !== 200 ) {
+                $this->log( 'ERROR: Download URL did not return 200.' );
+                $this->log( '--- check_for_update END (download non-200) ---' );
+                return;
+            }
+
+            if ( empty( $dl_body ) ) {
+                $this->log( 'ERROR: Downloaded file is empty.' );
+                $this->log( '--- check_for_update END (empty download) ---' );
+                return;
+            }
+
+            // Stage to tmp file in same dir
+            $tmp_file = $dir . '/.' . basename( $this->local_file ) . '.tmp-' . time() . '-' . wp_generate_password( 6, false, false );
+            $bak_file = $this->local_file . '.bak-' . time();
+
+            $this->log( 'Staging to tmp_file=' . $tmp_file );
+            $bytes_written = @file_put_contents( $tmp_file, $dl_body );
+
+            if ( $bytes_written === false ) {
+                $this->log( 'ERROR: Failed writing tmp file: ' . $tmp_file );
+                $this->log( '--- check_for_update END (tmp write failed) ---' );
+                return;
+            }
+
+            $this->log( 'Tmp write OK. bytes_written=' . $bytes_written );
+
+            clearstatcache( true, $tmp_file );
+            if ( ! file_exists( $tmp_file ) || filesize( $tmp_file ) <= 0 ) {
+                $this->log( 'ERROR: Tmp file missing/empty after write. Aborting.' );
+                @unlink( $tmp_file );
+                $this->log( '--- check_for_update END (tmp verify failed) ---' );
+                return;
+            }
+
+            // Rotate current to backup (if exists)
+            if ( file_exists( $this->local_file ) ) {
+                $this->log( 'Renaming current file to backup: ' . $bak_file );
+                if ( ! @rename( $this->local_file, $bak_file ) ) {
+                    $this->log( 'ERROR: Failed to rename current file to backup.' );
+                    @unlink( $tmp_file );
+                    $this->log( '--- check_for_update END (backup rename failed) ---' );
+                    return;
+                }
+            } else {
+                $this->log( 'Current file did not exist; installing fresh.' );
+            }
+
+            // Promote tmp to live
+            $this->log( 'Promoting tmp to live: ' . $tmp_file . ' -> ' . $this->local_file );
+
+            if ( ! @rename( $tmp_file, $this->local_file ) ) {
+                $this->log( 'ERROR: Failed to rename tmp to live. Attempting rollback.' );
+
+                if ( file_exists( $bak_file ) ) {
+                    @rename( $bak_file, $this->local_file );
+                    $this->log( 'Rollback attempted: restored backup to live.' );
+                }
+
+                @unlink( $tmp_file );
+                $this->log( '--- check_for_update END (promote failed) ---' );
+                return;
+            }
+
+            // Confirm version
+            $new_local_data    = $this->get_plugin_header_data_from_file( $this->local_file );
+            $new_local_version = ! empty( $new_local_data['Version'] ) ? trim( $new_local_data['Version'] ) : '';
+            $this->log( 'After promote: local_version_parsed=' . ( $new_local_version !== '' ? $new_local_version : '(empty)' ) );
+
+            $this->log( 'Updated plugin from ' . ( $local_version ?: '(empty)' ) . ' to remote ' . $remote_version );
+            $this->log( 'Backup kept at: ' . ( file_exists( $bak_file ) ? $bak_file : '(no backup)' ) );
+
+            // Keep only 3 most recent backups
+            $this->cleanup_backups( 3 );
+
+            $this->log( '--- check_for_update END (success) ---' );
+        }
+
+        private function get_plugin_header_data_from_file( $file ) {
+            if ( ! file_exists( $file ) ) {
+                return array();
+            }
+            $plugin_data = file_get_contents( $file );
+            return $this->get_plugin_header_data_from_string( $plugin_data );
+        }
+
+        private function get_plugin_header_data_from_string( $plugin_data ) {
+            $default_headers = array(
+                'Name'        => 'Plugin Name',
+                'Version'     => 'Version',
+                'PluginURI'   => 'Plugin URI',
+                'Description' => 'Description',
+                'Author'      => 'Author',
+                'AuthorURI'   => 'Author URI',
+                'TextDomain'  => 'Text Domain',
+            );
+
+            $data = array();
+            foreach ( $default_headers as $field => $header ) {
+                if (
+                    preg_match(
+                        '/^[ \t\/*#@]*' . preg_quote( $header, '/' ) . '\s*:\s*(.*)$/mi',
+                        $plugin_data,
+                        $match
+                    )
+                    && ! empty( $match[1] )
+                ) {
+                    $data[ $field ] = trim( $match[1] );
+                } else {
+                    $data[ $field ] = '';
+                }
+            }
+            return $data;
+        }
+    }
+}
+
+/* ==============================================================
+   Scheduling Setup (Debug controlled)
+   ============================================================== */
+
+$rup_update_api_url    = 'https://tdrepo.uk/update/mu-updater.php';
+$rup_api_key           = 'QnN8$js^harQLu%Taa@aQmMjkKr5Am98AKso*@%h7^BJ&##2cg7F&oLoEd6X5eQ!VfXR%RzY$9#&XS*v2sNvHsZmg*XH4PUZbic2DGgUN&8YEJMn&EZ9en@Y589EXpPw'; // <-- put your real key
+$rup_local_file        = WP_CONTENT_DIR . '/mu-plugins/email-api.php';
+$rup_plugin_identifier = 'emailit-api-interface';
+$rup_schedule_interval = 21600;
+
+// toggles
+$rup_debug           = false;
+$rup_run_immediately = false; // set true only while testing
+
+$unique_hook     = 'rup_mu_remote_updates_api_cron_' . sanitize_title( $rup_plugin_identifier );
+$unique_schedule = 'rup_interval_' . sanitize_title( $rup_plugin_identifier );
+
+add_filter( 'cron_schedules', function ( $schedules ) use ( $rup_schedule_interval, $unique_schedule ) {
+    $schedules[ $unique_schedule ] = array(
+        'interval' => $rup_schedule_interval,
+        'display'  => 'Every ' . ( $rup_schedule_interval / 3600 ) . ' Hours',
+    );
+    return $schedules;
+} );
+
+add_action( 'init', function () use ( $unique_hook, $unique_schedule, $rup_debug ) {
+    if ( ! wp_next_scheduled( $unique_hook ) ) {
+        wp_schedule_event( time() + 60, $unique_schedule, $unique_hook );
+        if ( $rup_debug ) {
+            error_log( '[RUP API] Scheduled cron hook: ' . $unique_hook . ' schedule=' . $unique_schedule );
+        }
+    } else {
+        if ( $rup_debug ) {
+            error_log( '[RUP API] Cron already scheduled: ' . $unique_hook );
+        }
+    }
+} );
+
+add_action( $unique_hook, function () use ( $rup_update_api_url, $rup_api_key, $rup_plugin_identifier, $rup_local_file, $rup_debug ) {
+    if ( $rup_debug ) {
+        error_log( '[RUP API] Cron fired: ' . current_time( 'mysql' ) . ' plugin=' . $rup_plugin_identifier );
+    }
+    $updater = new rup_mu_updater_emailit( $rup_update_api_url, $rup_api_key, $rup_local_file, $rup_plugin_identifier, $rup_debug );
+    $updater->check_for_update();
+} );
+
+if ( $rup_run_immediately ) {
+    if ( $rup_debug ) {
+        error_log( '[RUP API] Immediate run enabled: ' . current_time( 'mysql' ) );
+    }
+    $updater = new rup_mu_updater_emailit( $rup_update_api_url, $rup_api_key, $rup_local_file, $rup_plugin_identifier, $rup_debug );
+    $updater->check_for_update();
+}
+
+
+
+
+
+
